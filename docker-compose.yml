@@ -1,0 +1,203 @@
+services:
+  go_backend:
+    build:
+      context: /Go/
+      dockerfile: Dockerfile
+    container_name: go_backend
+    networks:
+      - internal
+    restart: always
+    volumes:
+      - ./Go:/app
+    environment:
+      DATABASE_URL: "${DATABASE_URL}"
+      CLIENT_ID: "${ADMIN_CLIENT_ID}"
+      CLIENT_SECRET: "${CLIENT_SECRET}"
+      KEYCLOAK_URL: "${KEYCLOAK_URL}"
+      REALM: "${REALM}"
+      REDIS_ADDR: "${REDIS_ADDR}"
+      REDIS_PASSWORD: "${REDIS_PASSWORD}"
+      CGO_ENABLED: 1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    depends_on:
+      - redis
+  redis:
+    image: redis:alpine
+    container_name: redis
+    volumes:
+      - ./redis_cache:/data 
+    restart: unless-stopped
+    networks:
+      - internal
+
+  react_frontend:
+    image: node:lts-alpine
+    container_name: react_frontend
+    networks:
+      - internal
+    restart: always
+    working_dir: /usr/src/app
+    command: >
+      sh -c "
+      npm install @rollup/rollup-linux-x64-musl && (INLINE_RUNTIME_CHUNK=false) && npm run build && npm run dev
+      "
+    environment:
+      VITE_PUBLIC_URL: "${VITE_PUBLIC_URL}"
+      VITE_USER_CLIENT_ID: "${VITE_USER_CLIENT_ID}"
+      VITE_REALM: "${VITE_REALM}"
+      VITE_WATCHPACK_POLLING: "${VITE_WATCHPACK_POLLING}"
+    volumes:
+      - ./React-Vite:/usr/src/app
+      - ./React-Vite/node_modules:/usr/src/app/node_modules
+      - ./React-Vite/dist:/usr/src/app/dist  # Mount the dist (build) directory to the host so we can serve to NGINX for static file serving
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  nginx_http:
+    image: nginx:alpine-slim
+    container_name: nginx_http
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./React-Vite/dist:/usr/share/nginx/html  # Mount the dist (build) directory to NGINX for static file serving
+      - ./nginx/certs:/etc/nginx/certs
+      - ./nginx/nginx-http.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/entrypoint.sh:/usr/local/bin/entrypoint.sh 
+    entrypoint: /usr/local/bin/entrypoint.sh
+    depends_on:
+      go_backend:
+        condition: service_healthy
+      react_frontend:
+        condition: service_healthy
+    networks:
+      - internal
+      - web
+    profiles:
+      - http
+
+  nginx_prod:
+    image: nginx:alpine-slim
+    container_name: nginx-prod
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx-prod.conf:/etc/nginx/nginx.conf:ro
+      - /nginx/certs/cert.pem:/etc/nginx/certs/cert.pem:ro 
+      - /nginx/certs/private.key:/etc/nginx/certs/key:ro
+    depends_on:
+      go_backend:
+        condition: service_healthy
+      react_frontend:
+        condition: service_healthy
+    networks:
+      - internal
+      - web
+    profiles:
+      - production
+
+  postgres:
+    image: postgres:latest # Convert to alpine later
+    container_name: postgres
+    networks:
+      - internal
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB}"
+      POSTGRES_USER: "${POSTGRES_USER}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+    volumes:
+      - ./postgres_data:/var/lib/postgresql/data
+
+  keycloak:
+    image: bitnami/keycloak:latest # No alpine, support. However, uses a minimalist Debian based container image
+    container_name: keycloak
+    networks:
+      #- web
+      - internal
+    #ports:
+      #- 8080:8080
+    environment:
+      DB_VENDOR: "${KEYCLOAK_DB_VENDOR}"
+      DB_ADDR: "${KEYCLOAK_DB_ADDR}"
+      DB_DATABASE: "${KEYCLOAK_DB_DATABASE}"
+      DB_USER: "${KEYCLOAK_DB_USER}"
+      DB_SCHEMA: "${KEYCLOAK_DB_SCHEMA}"
+      DB_PASSWORD: "${KEYCLOAK_DB_PASSWORD}"
+      PROXY_ADDRESS_FORWARDING: "${KEYCLOAK_PROXY_ADDRESS_FORWARDING}"
+    depends_on:
+      - postgres
+
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: pgadmin
+    networks:
+      - internal
+    environment:
+      PGADMIN_DEFAULT_EMAIL: "${PGADMIN_DEFAULT_EMAIL}"
+      PGADMIN_DEFAULT_PASSWORD: "${PGADMIN_DEFAULT_PASSWORD}"
+
+  sonarqube:
+    image: sonarqube:latest
+    container_name: sonarqube
+    networks:
+      - internal
+    environment:
+      SONAR_ES_BOOTSTRAP_CHECKS_DISABLE: true
+    volumes:
+      - ./sonarqube/sonarqube_data:/opt/sonarqube/data
+      - ./sonarqube/sonarqube_extensions:/opt/sonarqube/extensions
+      - ./sonarqube/sonarqube_logs:/opt/sonarqube/logs
+    profiles:
+      - dev
+
+  sonarscanner:
+    image: sonarsource/sonar-scanner-cli
+    container_name: sonarscanner
+    depends_on:
+      - sonarqube
+      - react_frontend
+      - go_backend
+    networks:
+      - internal
+    volumes:
+      - ./React-Vite:/usr/src/frontend
+      - ./Go:/usr/src/backend
+    entrypoint: >
+      sh -c "
+      sonar-scanner -Dsonar.projectKey=${FRONTEND_NAME} -Dsonar.sources=/usr/src/frontend -Dsonar.host.url=${SONARQUBE_HOST_URL} -Dsonar.token=${SONARQUBE_TOKEN} -Dsonar.exclusions=node_modules/** &&
+      sonar-scanner -Dsonar.projectKey=${BACKEND_NAME} -Dsonar.sources=/usr/src/backend -Dsonar.host.url=${SONARQUBE_HOST_URL} -Dsonar.token=${SONARQUBE_TOKEN} -Dsonar.exclusions=vendor/**
+      "
+    profiles:
+      - dev
+
+  owasp_zap:
+    image: zaproxy/zap-stable
+    container_name: owasp_zap
+    networks:
+      - internal
+    depends_on:
+      - go_backend
+    entrypoint: >
+      sh -c "
+      zap-api-scan.py -t http://go_backend:8001/swagger/doc.json -f openapi -r scan-report.html
+      "
+    volumes:
+      - ./:/zap/wrk:rw
+    profiles:
+      - dev
+
+networks:
+  web:
+    driver: bridge
+  internal:
+    driver: bridge
